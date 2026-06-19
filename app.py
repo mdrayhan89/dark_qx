@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Quotex Live Candle API – with automatic free proxy fetching
+Quotex Live Candle API – with automatic proxy & verbose logs
 """
 import asyncio
 import threading
@@ -13,11 +13,12 @@ import random
 from typing import Optional, Dict, List, Tuple, Set
 from datetime import datetime
 
+# ---- Force print to be unbuffered ----
+sys.stdout.reconfigure(line_buffering=True)
+
 # ---- Auto proxy fetch ----
 def fetch_free_proxy():
-    """Get a working SOCKS5 proxy from public list."""
     try:
-        # Primary source: proxyscrape (free)
         url = "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=socks5&timeout=10000&country=all"
         resp = requests.get(url, timeout=15)
         if resp.status_code == 200:
@@ -25,10 +26,8 @@ def fetch_free_proxy():
             if proxies:
                 proxy = random.choice(proxies)
                 return f"socks5://{proxy}"
-    except Exception:
-        pass
-
-    # Backup: use a static list of public SOCKS5 proxies (may be outdated)
+    except Exception as e:
+        print(f"Proxy fetch error: {e}")
     fallback_list = [
         "socks5://51.158.98.49:1080",
         "socks5://51.15.76.39:1080",
@@ -38,7 +37,6 @@ def fetch_free_proxy():
     ]
     return random.choice(fallback_list)
 
-# Get proxy from env or auto-fetch
 PROXY_URL = os.environ.get("QUOTEX_PROXY")
 if not PROXY_URL:
     print("🔍 No QUOTEX_PROXY set, fetching free proxy...")
@@ -46,22 +44,21 @@ if not PROXY_URL:
     if PROXY_URL:
         print(f"✅ Using proxy: {PROXY_URL}")
     else:
-        print("⚠️ Could not fetch any proxy. Will try without proxy (may fail).")
+        print("⚠️ Could not fetch any proxy. Will try without proxy.")
 
 if PROXY_URL:
     os.environ['HTTP_PROXY'] = PROXY_URL
     os.environ['HTTPS_PROXY'] = PROXY_URL
     os.environ['ALL_PROXY'] = PROXY_URL
 
-# SSL setup
+# SSL
 import certifi
 os.environ['SSL_CERT_FILE'] = certifi.where()
 os.environ['WEBSOCKET_CLIENT_CA_BUNDLE'] = certifi.where()
 
-# Patch websocket for proxy
+# Patch websocket
 if PROXY_URL:
     import websocket
-    from urllib.parse import urlparse
     original_create = websocket.create_connection
     def patched_create(*args, **kwargs):
         kwargs['proxy'] = PROXY_URL
@@ -76,15 +73,7 @@ except ImportError as e:
     print(f"❌ Missing dependency: {e}")
     sys.exit(1)
 
-# ------------------------------------------------------------
-# Configuration
-# ------------------------------------------------------------
-CONSOLE_LEVEL = 1
-def log(msg: str, level: int = 1):
-    if level <= CONSOLE_LEVEL:
-        print(msg)
-
-# Asset maps (same as before)
+# ---- Asset maps (same) ----
 ASSET_DISPLAY_MAP: Dict[str, str] = {}
 forex_assets = {
     "AUDCAD": "AUD/CAD", "AUDCAD_otc": "AUD/CAD (OTC)", "AUDCHF": "AUD/CHF", "AUDCHF_otc": "AUD/CHF (OTC)",
@@ -105,7 +94,6 @@ forex_assets = {
     "USDTRY_otc": "USD/TRY (OTC)", "USDZAR_otc": "USD/ZAR (OTC)",
 }
 ASSET_DISPLAY_MAP.update(forex_assets)
-
 crypto_assets = {
     "ADAUSD_otc": "Cardano (OTC)", "APTUSD_otc": "Aptos (OTC)", "ARBUSD_otc": "Arbitrum (OTC)", "ATOUSD_otc": "ATO (OTC)",
     "AVAUSD_otc": "Avalanche (OTC)", "AXSUSD_otc": "Axie Infinity (OTC)", "BCHUSD_otc": "Bitcoin Cash (OTC)",
@@ -118,20 +106,17 @@ crypto_assets = {
     "ZECUSD_otc": "Zcash (OTC)",
 }
 ASSET_DISPLAY_MAP.update(crypto_assets)
-
 commodities_assets = {
     "XAUUSD": "Gold", "XAUUSD_otc": "Gold (OTC)", "XAGUSD": "Silver", "XAGUSD_otc": "Silver (OTC)",
     "UKBrent_otc": "UK Brent (OTC)", "USCrude_otc": "US Crude (OTC)",
 }
 ASSET_DISPLAY_MAP.update(commodities_assets)
-
 stocks_assets = {
     "AXP_otc": "American Express (OTC)", "BA_otc": "Boeing Company (OTC)", "FB_otc": "Facebook (OTC)",
     "INTC_otc": "Intel (OTC)", "JNJ_otc": "Johnson & Johnson (OTC)", "MCD_otc": "McDonald's (OTC)",
     "MSFT_otc": "Microsoft (OTC)", "PFE_otc": "Pfizer Inc (OTC)", "PEPUSD_otc": "PepsiCo (OTC)",
 }
 ASSET_DISPLAY_MAP.update(stocks_assets)
-
 indices_assets = {
     "DJIUSD": "Dow Jones", "NDXUSD": "NASDAQ 100", "F40EUR": "CAC 40", "FTSGBP": "FTSE 100",
     "HSIHKD": "Hong Kong 50", "IBXEUR": "IBEX 35", "JPXJPY": "Nikkei 225", "CHIA50": "China A50",
@@ -154,14 +139,14 @@ TIMEFRAME_API_MAP = {
     "1h": "H1", "4h": "H4"
 }
 
-# Global state
+# ---- Global state ----
 CLIENT: Optional[Quotex] = None
 CANDLES: Dict[str, Dict[str, List[dict]]] = {}
 CURRENT_CANDLE: Dict[str, Dict[str, dict]] = {}
 STREAMING_ASSETS: Set[str] = set()
 CONNECTED = False
 
-# Async loop
+# ---- Async loop ----
 ASYNC_LOOP = asyncio.new_event_loop()
 def start_loop():
     asyncio.set_event_loop(ASYNC_LOOP)
@@ -196,7 +181,7 @@ def process_candle_data(raw_candles: List[dict], period: int) -> List[dict]:
         try:
             return process_candles(raw_candles, period)
         except Exception as e:
-            log(f"⚠️ process_candles failed: {e}", level=2)
+            print(f"⚠️ process_candles failed: {e}")
     formatted = []
     for c in raw_candles:
         if not isinstance(c, dict):
@@ -242,57 +227,60 @@ def update_candle(asset_display: str, frame: str, price: float, ts_sec: int):
         curr["close"] = float(price)
 
 # ------------------------------------------------------------
-# Quotex Connection and Streaming
+# Quotex Connection
 # ------------------------------------------------------------
 async def connect_to_quotex(email: str, password: str) -> Tuple[bool, str]:
     global CLIENT, CONNECTED
     try:
-        log("🔐 Connecting to Quotex via proxy (if set)...", level=1)
+        print("🔐 Connecting to Quotex...")
         CLIENT = Quotex(email=email, password=password, host="qxbroker.com", lang="en")
         check, reason = await CLIENT.connect()
         if not check:
+            print(f"❌ Connection failed: {reason}")
             return False, reason
         await CLIENT.change_account("PRACTICE")
         await CLIENT.get_all_assets()
         CONNECTED = True
-        log("✅ Connected successfully", level=1)
+        print("✅ Quotex connected successfully!")
         return True, ""
     except Exception as e:
-        return False, f"{type(e).__name__}: {e}"
+        print(f"❌ Exception during connect: {e}")
+        return False, str(e)
 
 async def start_streaming(asset_display: str):
     global CANDLES, CURRENT_CANDLE, STREAMING_ASSETS
     if not CLIENT or not CONNECTED:
-        log("❌ Not connected", level=0)
+        print("❌ Not connected")
         return
     if asset_display in STREAMING_ASSETS:
-        log(f"ℹ️ Already streaming {asset_display}", level=2)
+        print(f"ℹ️ Already streaming {asset_display}")
         return
 
     internal = DISPLAY_TO_INTERNAL.get(asset_display)
     if not internal:
-        log(f"❌ Unknown asset display name: {asset_display}", level=0)
+        print(f"❌ Unknown asset display name: {asset_display}")
         return
 
     period_sec = TIMEFRAMES.get("1m", 60)
     try:
+        print(f"📥 Loading history for {asset_display}...")
         hist = await CLIENT.get_candles(asset=internal, end_from_time=time.time(),
                                         offset=199 * period_sec, period=period_sec)
         candles = process_candle_data(hist, period_sec)
         if asset_display not in CANDLES:
             CANDLES[asset_display] = {}
         CANDLES[asset_display]["1m"] = candles[-199:]
-        log(f"📥 Loaded {len(candles)} candles for {asset_display}", level=1)
+        print(f"📥 Loaded {len(candles)} candles for {asset_display}")
     except Exception as e:
-        log(f"⚠️ Failed to load history for {asset_display}: {e}", level=2)
+        print(f"⚠️ Failed to load history for {asset_display}: {e}")
 
     try:
         await CLIENT.start_realtime_price(internal, period_sec)
         STREAMING_ASSETS.add(asset_display)
-        log(f"🔄 Started streaming {asset_display}", level=1)
+        print(f"🔄 Started streaming {asset_display}")
         asyncio.create_task(realtime_price_loop(asset_display))
     except Exception as e:
-        log(f"❌ Failed to start streaming {asset_display}: {e}", level=0)
+        print(f"❌ Failed to start streaming {asset_display}: {e}")
 
 async def realtime_price_loop(asset_display: str):
     internal = DISPLAY_TO_INTERNAL.get(asset_display)
@@ -309,11 +297,10 @@ async def realtime_price_loop(asset_display: str):
                     ts_sec = int(float(timestamp))
                     for frame in TIMEFRAMES:
                         update_candle(asset_display, frame, price, ts_sec)
-                    if CONSOLE_LEVEL >= 2:
-                        print(f"📊 {asset_display} {price:.5f}", end="\r")
+                    # print(f"📊 {asset_display} {price:.5f}", end="\r")
             await asyncio.sleep(0.2)
         except Exception as e:
-            log(f"⚠️ realtime loop error for {asset_display}: {e}", level=2)
+            print(f"⚠️ realtime loop error for {asset_display}: {e}")
             await asyncio.sleep(1)
 
 # ------------------------------------------------------------
@@ -333,6 +320,7 @@ def root():
         "connected": CONNECTED,
         "proxy_used": bool(PROXY_URL),
         "streaming_assets": list(STREAMING_ASSETS),
+        "env_vars_set": bool(os.environ.get("QUOTEX_EMAIL") and os.environ.get("QUOTEX_PASSWORD")),
         "endpoints": {
             "/api/candles?pair=USDPKR_otc&timeframe=1m&count=10": "Get candle data",
             "/api/assets": "List all assets",
@@ -354,7 +342,7 @@ def get_candles():
             "error": "Missing 'pair' parameter"
         }), 400
 
-    # Resolve asset
+    # Resolve asset - MUST return 400 if unknown
     display_name = None
     internal_name = None
 
@@ -374,7 +362,7 @@ def get_candles():
 
     # Start streaming if not already
     if CONNECTED and display_name not in STREAMING_ASSETS:
-        log(f"⏳ Starting streaming for {display_name}", level=1)
+        print(f"⏳ Starting streaming for {display_name}")
         asyncio.run_coroutine_threadsafe(start_streaming(display_name), ASYNC_LOOP)
 
     # Get candles
@@ -439,30 +427,34 @@ def list_timeframes():
     })
 
 # ------------------------------------------------------------
-# Background startup
+# Background startup with retries
 # ------------------------------------------------------------
 def startup_background():
-    time.sleep(2)
+    # Wait a moment for everything to settle
+    time.sleep(3)
     email = os.environ.get("QUOTEX_EMAIL")
     password = os.environ.get("QUOTEX_PASSWORD")
     if not email or not password:
-        log("❌ QUOTEX_EMAIL and QUOTEX_PASSWORD must be set as environment variables", level=0)
+        print("❌ QUOTEX_EMAIL and QUOTEX_PASSWORD must be set as environment variables")
         return
-    # Retry connection up to 3 times
-    for attempt in range(3):
+
+    for attempt in range(1, 4):
+        print(f"🔄 Login attempt {attempt}/3...")
         future = asyncio.run_coroutine_threadsafe(connect_to_quotex(email, password), ASYNC_LOOP)
         try:
-            success, msg = future.result(timeout=30)
+            success, msg = future.result(timeout=35)
             if success:
-                log("✅ Quotex connected. Ready to stream on demand.", level=1)
+                print("✅ Quotex connected. Ready to stream on demand.")
+                # Optionally start a default asset? We'll start on first request.
                 return
             else:
-                log(f"❌ Connection attempt {attempt+1} failed: {msg}", level=0)
+                print(f"❌ Attempt {attempt} failed: {msg}")
         except Exception as e:
-            log(f"❌ Startup error attempt {attempt+1}: {e}", level=0)
-        if attempt < 2:
-            time.sleep(5)  # wait before retry
-    log("❌ All connection attempts failed. Try setting QUOTEX_PROXY manually.", level=0)
+            print(f"❌ Attempt {attempt} exception: {e}")
+        if attempt < 3:
+            print("⏳ Waiting 10 seconds before retry...")
+            time.sleep(10)
+    print("❌ All connection attempts failed. Check your credentials and network.")
 
 threading.Thread(target=startup_background, daemon=True, name="Startup").start()
 
