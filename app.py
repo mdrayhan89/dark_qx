@@ -2,19 +2,16 @@
 # -*- coding: utf-8 -*-
 """
 Quotex Live Candle API – Headless version for Render
-Now supports on‑demand streaming for any asset.
+Now with better error handling and asset resolution.
 """
 import asyncio
 import threading
 import time
-import json
 import os
 import sys
-from pathlib import Path
 from typing import Optional, Dict, List, Tuple, Set
 from datetime import datetime
 
-# SSL setup
 import certifi
 os.environ['SSL_CERT_FILE'] = certifi.where()
 os.environ['WEBSOCKET_CLIENT_CA_BUNDLE'] = certifi.where()
@@ -109,12 +106,9 @@ CLIENT: Optional[Quotex] = None
 CANDLES: Dict[str, Dict[str, List[dict]]] = {}      # keyed by display name
 CURRENT_CANDLE: Dict[str, Dict[str, dict]] = {}      # keyed by display name
 STREAMING_ASSETS: Set[str] = set()                   # display names currently streaming
-REALTIME_RUNNING = False
-LAST_TICK_TIME = time.time()
-SERVER_TIME_OFFSET = 0
 CONNECTED = False
 
-# Async loop and thread
+# Async loop
 ASYNC_LOOP = asyncio.new_event_loop()
 def start_loop():
     asyncio.set_event_loop(ASYNC_LOOP)
@@ -214,7 +208,7 @@ async def connect_to_quotex(email: str, password: str) -> Tuple[bool, str]:
         return False, f"{type(e).__name__}: {e}"
 
 async def start_streaming(asset_display: str):
-    global REALTIME_RUNNING, CURRENT_CANDLE, CANDLES, STREAMING_ASSETS
+    global CANDLES, CURRENT_CANDLE, STREAMING_ASSETS
     if not CLIENT or not CONNECTED:
         log("❌ Not connected", level=0)
         return
@@ -224,12 +218,8 @@ async def start_streaming(asset_display: str):
 
     internal = DISPLAY_TO_INTERNAL.get(asset_display)
     if not internal:
-        log(f"❌ Unknown asset: {asset_display}", level=0)
+        log(f"❌ Unknown asset display name: {asset_display}", level=0)
         return
-
-    # Stop any previous realtime loop if it's for a different asset? We can have multiple.
-    # Actually pyquotex can handle multiple subscriptions, but we'll keep it simple and allow multiple.
-    # We'll just start the subscription and a new loop per asset.
 
     # Load historical data for 1m
     period_sec = TIMEFRAMES.get("1m", 60)
@@ -249,13 +239,11 @@ async def start_streaming(asset_display: str):
         await CLIENT.start_realtime_price(internal, period_sec)
         STREAMING_ASSETS.add(asset_display)
         log(f"🔄 Started streaming {asset_display}", level=1)
-        # Start a background loop for this asset
         asyncio.create_task(realtime_price_loop(asset_display))
     except Exception as e:
         log(f"❌ Failed to start streaming {asset_display}: {e}", level=0)
 
 async def realtime_price_loop(asset_display: str):
-    global LAST_TICK_TIME, REALTIME_RUNNING, SERVER_TIME_OFFSET
     internal = DISPLAY_TO_INTERNAL.get(asset_display)
     if not internal:
         return
@@ -268,8 +256,6 @@ async def realtime_price_loop(asset_display: str):
                 timestamp = latest.get("time", time.time())
                 if price > 0 and timestamp > 0:
                     ts_sec = int(float(timestamp))
-                    LAST_TICK_TIME = time.time()
-                    SERVER_TIME_OFFSET = timestamp - time.time()
                     for frame in TIMEFRAMES:
                         update_candle(asset_display, frame, price, ts_sec)
                     if CONSOLE_LEVEL >= 2:
@@ -293,6 +279,7 @@ def root():
         "Telegram": "@mdrayhan85",
         "service": "Quotex Live Candle API",
         "status": "running",
+        "connected": CONNECTED,
         "streaming_assets": list(STREAMING_ASSETS),
         "endpoints": {
             "/api/candles?pair=USDPKR_otc&timeframe=1m&count=10": "Get candle data",
@@ -315,46 +302,44 @@ def get_candles():
             "error": "Missing 'pair' parameter"
         }), 400
 
-    # Determine display name
-    display_name = pair
+    # ----- RESOLVE ASSET -----
+    display_name = None
+    internal_name = None
+
+    # 1. Check if pair is a known internal key (e.g., "USDPKR_otc")
     if pair in ASSET_DISPLAY_MAP:
-        # pair is internal -> get display name
+        internal_name = pair
         display_name = ASSET_DISPLAY_MAP[pair]
+    # 2. Check if pair is a known display name (e.g., "USD/PKR (OTC)")
     elif pair in DISPLAY_TO_INTERNAL:
-        # pair is already display name
         display_name = pair
+        internal_name = DISPLAY_TO_INTERNAL[pair]
     else:
-        # might be a direct internal not in map? try to find by value
-        # but we already have mapping, so just use as is
-        # Also, we can still try to find if pair is an internal key
-        if pair in ASSET_DISPLAY_MAP:
-            display_name = ASSET_DISPLAY_MAP[pair]
-        else:
-            # fallback: treat as display name
-            display_name = pair
+        # 3. Maybe the user sent a display name that is not in our map (e.g., "USD/PKR")?
+        # Try to find a match by case‑insensitive partial?
+        # For safety, we return an error.
+        return jsonify({
+            "Owner": "DARK-X-RAYHAN",
+            "Telegram": "@mdrayhan85",
+            "success": False,
+            "error": f"Unknown asset: '{pair}'. Use /api/assets to see available pairs."
+        }), 400
 
-    # Check if we have data for this asset
-    if display_name not in CANDLES or timeframe not in CANDLES[display_name]:
-        # Not yet loaded -> trigger streaming in background (async)
-        if CONNECTED and display_name not in STREAMING_ASSETS:
-            # start streaming asynchronously
-            asyncio.run_coroutine_threadsafe(start_streaming(display_name), ASYNC_LOOP)
-            log(f"⏳ Started background streaming for {display_name}", level=1)
-        # return empty for now
-        candles = []
-    else:
-        candles = CANDLES[display_name].get(timeframe, [])
+    # ----- ENSURE STREAMING IS ACTIVE -----
+    if CONNECTED and display_name not in STREAMING_ASSETS:
+        log(f"⏳ Starting streaming for {display_name} (requested as '{pair}')", level=1)
+        asyncio.run_coroutine_threadsafe(start_streaming(display_name), ASYNC_LOOP)
 
-    # Take last 'count'
+    # ----- GET CANDLES -----
+    candles = []
+    if display_name in CANDLES and timeframe in CANDLES[display_name]:
+        candles = CANDLES[display_name][timeframe]
+    # If not yet available, return empty; streaming is in background.
     candles = candles[-count:] if candles else []
 
-    # Get market name from map (if internal)
-    market_name = ASSET_DISPLAY_MAP.get(pair, display_name)
-    if pair in DISPLAY_TO_INTERNAL:
-        # pair is display name, we want internal for market name? Actually we want the display name itself.
-        market_name = pair
-
+    # ----- FORMAT RESPONSE -----
     api_tf = TIMEFRAME_API_MAP.get(timeframe, timeframe.upper())
+    market_name = ASSET_DISPLAY_MAP.get(internal_name, display_name)
     data = []
     for idx, c in enumerate(candles, start=1):
         dt = datetime.fromtimestamp(c["time"]).strftime("%Y-%m-%d %H:%M:%S")
@@ -363,8 +348,6 @@ def get_candles():
         low_val = f"{c['low']:.5f}".rstrip('0').rstrip('.')
         close_val = f"{c['close']:.5f}".rstrip('0').rstrip('.')
         color = "green" if c['close'] >= c['open'] else "red"
-        # For pair, we output the internal name if available, else display
-        internal_name = DISPLAY_TO_INTERNAL.get(display_name, display_name)
         data.append({
             "id": str(idx),
             "pair": internal_name.upper(),
@@ -410,7 +393,7 @@ def list_timeframes():
     })
 
 # ------------------------------------------------------------
-# Background startup for Quotex connection
+# Background startup
 # ------------------------------------------------------------
 def startup_background():
     time.sleep(2)
@@ -432,7 +415,7 @@ def startup_background():
 threading.Thread(target=startup_background, daemon=True, name="Startup").start()
 
 # ------------------------------------------------------------
-# For local development (optional)
+# Main
 # ------------------------------------------------------------
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=False)
