@@ -1,79 +1,67 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Quotex Live Candle API – with automatic proxy fallback
+Quotex Live Candle API – Direct connection (no proxy)
 """
 import asyncio
 import threading
 import time
 import os
 import sys
-import requests
-import random
 from typing import Optional, Dict, List, Tuple, Set
 from datetime import datetime
 
 sys.stdout.reconfigure(line_buffering=True)
 
-# ----- Proxy fetching -----
-def fetch_free_proxy():
-    try:
-        url = "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=socks5&timeout=10000&country=all"
-        resp = requests.get(url, timeout=10)
-        if resp.status_code == 200:
-            proxies = [line.strip() for line in resp.text.splitlines() if line.strip()]
-            if proxies:
-                proxy = random.choice(proxies)
-                return f"socks5://{proxy}"
-    except Exception as e:
-        print(f"Proxy fetch error: {e}")
-    return None
-
-# Get proxy from env or auto-fetch
-PROXY_URL = os.environ.get("QUOTEX_PROXY")
-if PROXY_URL == "":
-    PROXY_URL = None
-    print("🔓 Proxy explicitly disabled via QUOTEX_PROXY=''")
-elif not PROXY_URL:
-    print("🔍 No QUOTEX_PROXY set, fetching free proxy...")
-    PROXY_URL = fetch_free_proxy()
-    if PROXY_URL:
-        print(f"✅ Using proxy: {PROXY_URL}")
-    else:
-        print("⚠️ No proxy available – will try direct connection.")
-
-# Apply proxy if we have one
-if PROXY_URL:
-    os.environ['HTTP_PROXY'] = PROXY_URL
-    os.environ['HTTPS_PROXY'] = PROXY_URL
-    os.environ['ALL_PROXY'] = PROXY_URL
+# ----- Force no proxy -----
+os.environ.pop('HTTP_PROXY', None)
+os.environ.pop('HTTPS_PROXY', None)
+os.environ.pop('ALL_PROXY', None)
+print("🔓 Proxy disabled – direct connection only.")
 
 # SSL
 import certifi
 os.environ['SSL_CERT_FILE'] = certifi.where()
 os.environ['WEBSOCKET_CLIENT_CA_BUNDLE'] = certifi.where()
 
-# Patch WebSocket for proxy (only if proxy is set)
-if PROXY_URL:
-    try:
-        import websocket
-        original_create = websocket.create_connection
-        def patched_create(*args, **kwargs):
-            kwargs['proxy'] = PROXY_URL
-            return original_create(*args, **kwargs)
-        websocket.create_connection = patched_create
-        print("🔌 WebSocket proxy patch applied.")
-    except Exception as e:
-        print(f"⚠️ Could not patch websocket: {e}")
+# ----- Patch pyquotex to use custom headers -----
+import httpx
+from pyquotex.stable_api import Quotex
+from pyquotex.utils.processor import process_candles
 
-try:
-    from pyquotex.stable_api import Quotex
-    from pyquotex.utils.processor import process_candles
-except ImportError as e:
-    print(f"❌ Missing dependency: {e}")
-    sys.exit(1)
+# Override client creation to set User‑Agent
+_original_quotex_init = Quotex.__init__
+def _patched_quotex_init(self, email, password, host="quotex.io", lang="en", **kwargs):
+    # Create our own client with browser headers
+    self._custom_client = httpx.Client(
+        headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Origin": f"https://{host}",
+            "Referer": f"https://{host}/",
+        },
+        timeout=30.0
+    )
+    # Call original init
+    _original_quotex_init(self, email, password, host, lang, **kwargs)
+    # Replace the client with our custom one
+    if hasattr(self, 'api'):
+        self.api._client = self._custom_client
+    print(f"🔧 Custom User-Agent set (host={host})")
 
-# ----- Asset maps (same as before) -----
+Quotex.__init__ = _patched_quotex_init
+
+# Also patch connect to ensure client is used
+_original_connect = Quotex.connect
+async def _patched_connect(self, *args, **kwargs):
+    if hasattr(self, '_custom_client'):
+        if hasattr(self, 'api'):
+            self.api._client = self._custom_client
+    return await _original_connect(self, *args, **kwargs)
+Quotex.connect = _patched_connect
+
+# ----- Asset maps (same) -----
 ASSET_DISPLAY_MAP: Dict[str, str] = {}
 forex_assets = {
     "AUDCAD": "AUD/CAD", "AUDCAD_otc": "AUD/CAD (OTC)", "AUDCHF": "AUD/CHF", "AUDCHF_otc": "AUD/CHF (OTC)",
@@ -156,24 +144,6 @@ threading.Thread(target=start_loop, daemon=True, name="AsyncLoop").start()
 # ------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------
-def is_websocket_connected() -> bool:
-    try:
-        if not CLIENT or not CLIENT.api:
-            return False
-        if hasattr(CLIENT.api, '_is_connected'):
-            return bool(CLIENT.api._is_connected)
-        if hasattr(CLIENT.api, 'websocket_client'):
-            ws = CLIENT.api.websocket_client
-            if hasattr(ws, 'wss') and hasattr(ws.wss, 'sock'):
-                return ws.wss.sock is not None and getattr(ws.wss.sock, 'connected', False)
-            if hasattr(ws, 'connected'):
-                return bool(ws.connected)
-        if hasattr(CLIENT.api, 'check_connect'):
-            return CLIENT.api.check_connect()
-        return True
-    except Exception:
-        return False
-
 def process_candle_data(raw_candles: List[dict], period: int) -> List[dict]:
     if not raw_candles:
         return []
@@ -227,20 +197,16 @@ def update_candle(asset_display: str, frame: str, price: float, ts_sec: int):
         curr["close"] = float(price)
 
 # ------------------------------------------------------------
-# Quotex Connection with fallback
+# Quotex Connection (direct)
 # ------------------------------------------------------------
-async def connect_to_quotex(email: str, password: str, use_proxy: bool = True) -> Tuple[bool, str]:
+async def connect_to_quotex(email: str, password: str, host: str = "quotex.io") -> Tuple[bool, str]:
     global CLIENT, CONNECTED
     try:
-        print(f"🔐 Connecting to Quotex (proxy={use_proxy})...")
-        # If we want to bypass proxy, clear environment variables temporarily
-        if not use_proxy:
-            old_http = os.environ.pop('HTTP_PROXY', None)
-            old_https = os.environ.pop('HTTPS_PROXY', None)
-            old_all = os.environ.pop('ALL_PROXY', None)
-            # Also reset websocket patch? We'll just create a new client without proxy.
-
-        CLIENT = Quotex(email=email, password=password, host="qxbroker.com", lang="en")
+        print(f"🔐 Connecting directly to {host} (no proxy)...")
+        CLIENT = Quotex(email=email, password=password, host=host, lang="en")
+        # Ensure our custom client is attached
+        if hasattr(CLIENT, '_custom_client') and hasattr(CLIENT, 'api'):
+            CLIENT.api._client = CLIENT._custom_client
         check, reason = await CLIENT.connect()
         if not check:
             print(f"❌ Connection failed: {reason}")
@@ -253,12 +219,6 @@ async def connect_to_quotex(email: str, password: str, use_proxy: bool = True) -
     except Exception as e:
         print(f"❌ Exception during connect: {e}")
         return False, str(e)
-    finally:
-        # Restore proxy env vars if they were removed
-        if not use_proxy and PROXY_URL:
-            os.environ['HTTP_PROXY'] = PROXY_URL
-            os.environ['HTTPS_PROXY'] = PROXY_URL
-            os.environ['ALL_PROXY'] = PROXY_URL
 
 async def start_streaming(asset_display: str):
     global CANDLES, CURRENT_CANDLE, STREAMING_ASSETS
@@ -330,7 +290,7 @@ def root():
         "service": "Quotex Live Candle API",
         "status": "running",
         "connected": CONNECTED,
-        "proxy_used": bool(PROXY_URL),
+        "proxy_used": False,
         "streaming_assets": list(STREAMING_ASSETS),
         "env_vars_set": bool(os.environ.get("QUOTEX_EMAIL") and os.environ.get("QUOTEX_PASSWORD")),
         "endpoints": {
@@ -439,7 +399,7 @@ def list_timeframes():
     })
 
 # ------------------------------------------------------------
-# Background startup with fallback
+# Background startup with host fallback (no proxy)
 # ------------------------------------------------------------
 def startup_background():
     time.sleep(3)
@@ -449,38 +409,25 @@ def startup_background():
         print("❌ QUOTEX_EMAIL and QUOTEX_PASSWORD must be set")
         return
 
-    # Try with proxy first (if PROXY_URL is set)
-    use_proxy = bool(PROXY_URL)
-    for attempt in range(1, 4):
-        print(f"🔄 Login attempt {attempt}/3 (proxy={use_proxy})...")
+    hosts = ["quotex.io", "qxbroker.com", "www.qxbroker.com"]
+    for host in hosts:
+        print(f"🔄 Trying host {host}...")
         future = asyncio.run_coroutine_threadsafe(
-            connect_to_quotex(email, password, use_proxy),
+            connect_to_quotex(email, password, host),
             ASYNC_LOOP
         )
         try:
             success, msg = future.result(timeout=35)
             if success:
-                print("✅ Quotex connected. Ready to stream on demand.")
+                print(f"✅ Connected successfully using {host}!")
                 return
             else:
-                print(f"❌ Attempt {attempt} failed: {msg}")
+                print(f"❌ Host {host} failed: {msg}")
         except Exception as e:
-            print(f"❌ Attempt {attempt} exception: {e}")
+            print(f"❌ Host {host} exception: {e}")
+        time.sleep(5)
 
-        if attempt == 1 and use_proxy:
-            # First attempt with proxy failed – fallback to direct
-            print("⏳ Proxy failed. Falling back to direct connection...")
-            use_proxy = False
-            # Also clear proxy env vars for subsequent attempts
-            os.environ.pop('HTTP_PROXY', None)
-            os.environ.pop('HTTPS_PROXY', None)
-            os.environ.pop('ALL_PROXY', None)
-            # Continue to next attempt without proxy
-        elif attempt < 3:
-            print("⏳ Waiting 10 seconds before retry...")
-            time.sleep(10)
-
-    print("❌ All connection attempts failed. Check your credentials and network.")
+    print("❌ All hosts failed. Check your credentials and network.")
 
 threading.Thread(target=startup_background, daemon=True, name="Startup").start()
 
