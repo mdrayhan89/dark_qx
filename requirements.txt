@@ -1,4 +1,5 @@
-setuptools
 Flask==2.3.3
 gunicorn==21.2.0
+certifi>=2025.1.31
+setuptools
 git+https://github.com/cleitonleonel/pyquotex.git@master
