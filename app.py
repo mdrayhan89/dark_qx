@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Quotex Live Candle API – with automatic free proxy (no internal patches)
+Quotex Live Candle API – with validated free proxies
 """
 import asyncio
 import threading
@@ -10,58 +10,112 @@ import os
 import sys
 import requests
 import random
+import re
 from typing import Optional, Dict, List, Tuple, Set
 from datetime import datetime
+import urllib.parse
 
 sys.stdout.reconfigure(line_buffering=True)
 
-# ----- Proxy fetching from multiple sources -----
-def fetch_free_proxy():
-    """Return a SOCKS5 proxy URL or None."""
+# ----- Proxy fetching & validation -----
+def fetch_proxy_list():
+    """Return list of candidate proxies (protocol://host:port)."""
+    proxies = []
     sources = [
         ("https://api.proxyscrape.com/v2/?request=displayproxies&protocol=socks5&timeout=10000&country=all", "socks5"),
         ("https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=10000&country=all", "http"),
         ("https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt", "socks5"),
         ("https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt", "http"),
+        ("https://proxylist.geonode.com/api/proxy-list?limit=50&page=1&protocols=http%2Chttps%2Csocks4%2Csocks5&speed=fast", "http"),
     ]
     for url, proto in sources:
         try:
             resp = requests.get(url, timeout=10)
             if resp.status_code == 200:
                 lines = [line.strip() for line in resp.text.splitlines() if line.strip() and not line.startswith('#')]
-                if lines:
-                    proxy = random.choice(lines)
-                    return f"{proto}://{proxy}"
+                for line in lines:
+                    # Some sources give IP:PORT, others may already have protocol
+                    if '://' in line:
+                        proxies.append(line)
+                    else:
+                        proxies.append(f"{proto}://{line}")
         except Exception:
             continue
+    # Deduplicate
+    return list(set(proxies))
+
+def validate_proxy(proxy_url: str, test_url="https://qxbroker.com") -> bool:
+    """Check if proxy works by making a request."""
+    try:
+        # parse proxy
+        parsed = urllib.parse.urlparse(proxy_url)
+        proto = parsed.scheme
+        host = parsed.hostname
+        port = parsed.port
+        if not host or not port:
+            return False
+        # Use requests with proxy
+        proxies = {
+            "http": proxy_url,
+            "https": proxy_url,
+        } if proto in ('http', 'https') else {
+            "http": proxy_url,
+            "https": proxy_url,
+        }
+        # For SOCKS, we need to use requests with socks adapter, but we can test via curl-like approach
+        # We'll use a simple socket test or just try to connect
+        if proto.startswith('socks'):
+            # Use pysocks? Instead, we can rely on environment variable for websocket-client
+            # For validation, we'll just do a simple timeout test with socket
+            import socket
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(5)
+            result = sock.connect_ex((host, port))
+            sock.close()
+            return result == 0
+        else:
+            resp = requests.get(test_url, proxies=proxies, timeout=5, allow_redirects=False)
+            return resp.status_code in (200, 301, 302, 403)  # 403 might indicate we reached the server
+    except Exception:
+        return False
+
+def get_working_proxy() -> Optional[str]:
+    """Fetch and validate proxies; return first working one."""
+    candidates = fetch_proxy_list()
+    print(f"🔍 Found {len(candidates)} proxy candidates, testing...")
+    for proxy in candidates:
+        if validate_proxy(proxy):
+            print(f"✅ Valid proxy: {proxy}")
+            return proxy
+    print("❌ No working proxy found.")
     return None
 
+# ---- Try to get a working proxy ----
 PROXY_URL = os.environ.get("QUOTEX_PROXY")
 if PROXY_URL == "":
     PROXY_URL = None
     print("🔓 Proxy explicitly disabled.")
 elif not PROXY_URL:
-    print("🔍 Fetching free proxy...")
-    PROXY_URL = fetch_free_proxy()
-    if PROXY_URL:
-        print(f"✅ Using proxy: {PROXY_URL}")
-    else:
-        print("⚠️ No proxy found – will try direct.")
+    print("🔍 Fetching and testing free proxies...")
+    PROXY_URL = get_working_proxy()
+    if not PROXY_URL:
+        print("⚠️ No working proxy found – will try direct.")
 
-# Set environment variables for all libraries
 if PROXY_URL:
     os.environ['HTTP_PROXY'] = PROXY_URL
     os.environ['HTTPS_PROXY'] = PROXY_URL
     os.environ['ALL_PROXY'] = PROXY_URL
-    # Also set for websocket-client (it reads these)
     os.environ['WEBSOCKET_PROXY'] = PROXY_URL
+    print(f"✅ Proxy set: {PROXY_URL}")
+else:
+    print("🔓 Using direct connection (no proxy).")
 
 # SSL
 import certifi
 os.environ['SSL_CERT_FILE'] = certifi.where()
 os.environ['WEBSOCKET_CLIENT_CA_BUNDLE'] = certifi.where()
 
-# ---- Import pyquotex (no patches) ----
+# ---- Import pyquotex ----
 try:
     from pyquotex.stable_api import Quotex
     from pyquotex.utils.processor import process_candles
@@ -69,7 +123,7 @@ except ImportError as e:
     print(f"❌ Missing dependency: {e}")
     sys.exit(1)
 
-# ----- Asset maps -----
+# ----- Asset maps (same as before) -----
 ASSET_DISPLAY_MAP: Dict[str, str] = {}
 forex_assets = {
     "AUDCAD": "AUD/CAD", "AUDCAD_otc": "AUD/CAD (OTC)", "AUDCHF": "AUD/CHF", "AUDCHF_otc": "AUD/CHF (OTC)",
@@ -205,7 +259,7 @@ def update_candle(asset_display: str, frame: str, price: float, ts_sec: int):
         curr["close"] = float(price)
 
 # ------------------------------------------------------------
-# Quotex Connection (uses env proxy if set)
+# Quotex Connection
 # ------------------------------------------------------------
 async def connect_to_quotex(email: str, password: str, host: str = "qxbroker.com") -> Tuple[bool, str]:
     global CLIENT, CONNECTED
@@ -319,7 +373,6 @@ def get_candles():
             "error": "Missing 'pair' parameter"
         }), 400
 
-    # Resolve asset
     display_name = None
     internal_name = None
 
@@ -337,18 +390,15 @@ def get_candles():
             "error": f"Unknown asset: '{pair}'. Use /api/assets to see available pairs."
         }), 400
 
-    # Start streaming if not already
     if CONNECTED and display_name not in STREAMING_ASSETS:
         print(f"⏳ Starting streaming for {display_name}")
         asyncio.run_coroutine_threadsafe(start_streaming(display_name), ASYNC_LOOP)
 
-    # Get candles
     candles = []
     if display_name in CANDLES and timeframe in CANDLES[display_name]:
         candles = CANDLES[display_name][timeframe]
     candles = candles[-count:] if candles else []
 
-    # Format response
     api_tf = TIMEFRAME_API_MAP.get(timeframe, timeframe.upper())
     market_name = ASSET_DISPLAY_MAP.get(internal_name, display_name)
     data = []
@@ -414,29 +464,12 @@ def startup_background():
         print("❌ QUOTEX_EMAIL and QUOTEX_PASSWORD must be set")
         return
 
-    hosts = ["qxbroker.com", "quotex.io", "www.qxbroker.com"]
-    # If we have a proxy, we can try both with and without
-    attempts = []
-    if PROXY_URL:
-        attempts.append((True, "with proxy"))
-    attempts.append((False, "without proxy"))
-
-    for use_proxy, label in attempts:
-        for host in hosts:
-            print(f"🔄 Trying {host} {label}...")
-            # If not using proxy, temporarily clear env vars
-            if not use_proxy and PROXY_URL:
-                old_http = os.environ.pop('HTTP_PROXY', None)
-                old_https = os.environ.pop('HTTPS_PROXY', None)
-                old_all = os.environ.pop('ALL_PROXY', None)
-                old_ws = os.environ.pop('WEBSOCKET_PROXY', None)
-            elif use_proxy and PROXY_URL:
-                # ensure they are set
-                os.environ['HTTP_PROXY'] = PROXY_URL
-                os.environ['HTTPS_PROXY'] = PROXY_URL
-                os.environ['ALL_PROXY'] = PROXY_URL
-                os.environ['WEBSOCKET_PROXY'] = PROXY_URL
-
+    hosts = ["qxbroker.com", "quotex.io"]
+    # Try with proxy if we have one, else direct
+    use_proxy = bool(PROXY_URL)
+    for host in hosts:
+        for attempt in range(1, 4):
+            print(f"🔄 Attempt {attempt} for {host} (proxy={use_proxy})...")
             future = asyncio.run_coroutine_threadsafe(
                 connect_to_quotex(email, password, host),
                 ASYNC_LOOP
@@ -444,23 +477,39 @@ def startup_background():
             try:
                 success, msg = future.result(timeout=35)
                 if success:
-                    print(f"✅ Connected successfully using {host} {label}!")
+                    print(f"✅ Connected successfully using {host}!")
                     return
                 else:
-                    print(f"❌ {host} {label} failed: {msg}")
+                    print(f"❌ Attempt {attempt} failed: {msg}")
             except Exception as e:
-                print(f"❌ {host} {label} exception: {e}")
+                print(f"❌ Attempt {attempt} exception: {e}")
+            time.sleep(5)  # wait before retry
 
-            # Restore proxy env if we removed them
-            if not use_proxy and PROXY_URL:
-                os.environ['HTTP_PROXY'] = PROXY_URL
-                os.environ['HTTPS_PROXY'] = PROXY_URL
-                os.environ['ALL_PROXY'] = PROXY_URL
-                os.environ['WEBSOCKET_PROXY'] = PROXY_URL
+    # If proxy failed, try without proxy (if we had one)
+    if PROXY_URL:
+        print("🔄 Proxy failed, trying without proxy...")
+        # Temporarily remove proxy env vars
+        for key in ['HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'WEBSOCKET_PROXY']:
+            os.environ.pop(key, None)
+        for host in hosts:
+            for attempt in range(1, 3):
+                print(f"🔄 Direct attempt {attempt} for {host}...")
+                future = asyncio.run_coroutine_threadsafe(
+                    connect_to_quotex(email, password, host),
+                    ASYNC_LOOP
+                )
+                try:
+                    success, msg = future.result(timeout=35)
+                    if success:
+                        print(f"✅ Connected directly using {host}!")
+                        return
+                    else:
+                        print(f"❌ Direct attempt {attempt} failed: {msg}")
+                except Exception as e:
+                    print(f"❌ Direct attempt {attempt} exception: {e}")
+                time.sleep(5)
 
-            time.sleep(3)  # short delay between attempts
-
-    print("❌ All attempts failed. Check credentials and network.")
+    print("❌ All connection attempts failed. Check credentials and network.")
 
 threading.Thread(target=startup_background, daemon=True, name="Startup").start()
 
