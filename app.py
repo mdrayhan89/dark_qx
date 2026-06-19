@@ -1,20 +1,73 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Quotex Live Candle API – Headless version for Render
-Now with better error handling and asset resolution.
+Quotex Live Candle API – with automatic free proxy fetching
 """
 import asyncio
 import threading
 import time
 import os
 import sys
+import requests
+import random
 from typing import Optional, Dict, List, Tuple, Set
 from datetime import datetime
 
+# ---- Auto proxy fetch ----
+def fetch_free_proxy():
+    """Get a working SOCKS5 proxy from public list."""
+    try:
+        # Primary source: proxyscrape (free)
+        url = "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=socks5&timeout=10000&country=all"
+        resp = requests.get(url, timeout=15)
+        if resp.status_code == 200:
+            proxies = [line.strip() for line in resp.text.splitlines() if line.strip()]
+            if proxies:
+                proxy = random.choice(proxies)
+                return f"socks5://{proxy}"
+    except Exception:
+        pass
+
+    # Backup: use a static list of public SOCKS5 proxies (may be outdated)
+    fallback_list = [
+        "socks5://51.158.98.49:1080",
+        "socks5://51.15.76.39:1080",
+        "socks5://51.15.76.38:1080",
+        "socks5://51.15.76.37:1080",
+        "socks5://51.15.76.36:1080",
+    ]
+    return random.choice(fallback_list)
+
+# Get proxy from env or auto-fetch
+PROXY_URL = os.environ.get("QUOTEX_PROXY")
+if not PROXY_URL:
+    print("🔍 No QUOTEX_PROXY set, fetching free proxy...")
+    PROXY_URL = fetch_free_proxy()
+    if PROXY_URL:
+        print(f"✅ Using proxy: {PROXY_URL}")
+    else:
+        print("⚠️ Could not fetch any proxy. Will try without proxy (may fail).")
+
+if PROXY_URL:
+    os.environ['HTTP_PROXY'] = PROXY_URL
+    os.environ['HTTPS_PROXY'] = PROXY_URL
+    os.environ['ALL_PROXY'] = PROXY_URL
+
+# SSL setup
 import certifi
 os.environ['SSL_CERT_FILE'] = certifi.where()
 os.environ['WEBSOCKET_CLIENT_CA_BUNDLE'] = certifi.where()
+
+# Patch websocket for proxy
+if PROXY_URL:
+    import websocket
+    from urllib.parse import urlparse
+    original_create = websocket.create_connection
+    def patched_create(*args, **kwargs):
+        kwargs['proxy'] = PROXY_URL
+        return original_create(*args, **kwargs)
+    websocket.create_connection = patched_create
+    print("🔌 WebSocket proxy patch applied.")
 
 try:
     from pyquotex.stable_api import Quotex
@@ -103,9 +156,9 @@ TIMEFRAME_API_MAP = {
 
 # Global state
 CLIENT: Optional[Quotex] = None
-CANDLES: Dict[str, Dict[str, List[dict]]] = {}      # keyed by display name
-CURRENT_CANDLE: Dict[str, Dict[str, dict]] = {}      # keyed by display name
-STREAMING_ASSETS: Set[str] = set()                   # display names currently streaming
+CANDLES: Dict[str, Dict[str, List[dict]]] = {}
+CURRENT_CANDLE: Dict[str, Dict[str, dict]] = {}
+STREAMING_ASSETS: Set[str] = set()
 CONNECTED = False
 
 # Async loop
@@ -194,7 +247,7 @@ def update_candle(asset_display: str, frame: str, price: float, ts_sec: int):
 async def connect_to_quotex(email: str, password: str) -> Tuple[bool, str]:
     global CLIENT, CONNECTED
     try:
-        log("🔐 Connecting to Quotex...", level=1)
+        log("🔐 Connecting to Quotex via proxy (if set)...", level=1)
         CLIENT = Quotex(email=email, password=password, host="qxbroker.com", lang="en")
         check, reason = await CLIENT.connect()
         if not check:
@@ -221,7 +274,6 @@ async def start_streaming(asset_display: str):
         log(f"❌ Unknown asset display name: {asset_display}", level=0)
         return
 
-    # Load historical data for 1m
     period_sec = TIMEFRAMES.get("1m", 60)
     try:
         hist = await CLIENT.get_candles(asset=internal, end_from_time=time.time(),
@@ -234,7 +286,6 @@ async def start_streaming(asset_display: str):
     except Exception as e:
         log(f"⚠️ Failed to load history for {asset_display}: {e}", level=2)
 
-    # Start realtime subscription
     try:
         await CLIENT.start_realtime_price(internal, period_sec)
         STREAMING_ASSETS.add(asset_display)
@@ -280,6 +331,7 @@ def root():
         "service": "Quotex Live Candle API",
         "status": "running",
         "connected": CONNECTED,
+        "proxy_used": bool(PROXY_URL),
         "streaming_assets": list(STREAMING_ASSETS),
         "endpoints": {
             "/api/candles?pair=USDPKR_otc&timeframe=1m&count=10": "Get candle data",
@@ -302,22 +354,17 @@ def get_candles():
             "error": "Missing 'pair' parameter"
         }), 400
 
-    # ----- RESOLVE ASSET -----
+    # Resolve asset
     display_name = None
     internal_name = None
 
-    # 1. Check if pair is a known internal key (e.g., "USDPKR_otc")
     if pair in ASSET_DISPLAY_MAP:
         internal_name = pair
         display_name = ASSET_DISPLAY_MAP[pair]
-    # 2. Check if pair is a known display name (e.g., "USD/PKR (OTC)")
     elif pair in DISPLAY_TO_INTERNAL:
         display_name = pair
         internal_name = DISPLAY_TO_INTERNAL[pair]
     else:
-        # 3. Maybe the user sent a display name that is not in our map (e.g., "USD/PKR")?
-        # Try to find a match by case‑insensitive partial?
-        # For safety, we return an error.
         return jsonify({
             "Owner": "DARK-X-RAYHAN",
             "Telegram": "@mdrayhan85",
@@ -325,19 +372,18 @@ def get_candles():
             "error": f"Unknown asset: '{pair}'. Use /api/assets to see available pairs."
         }), 400
 
-    # ----- ENSURE STREAMING IS ACTIVE -----
+    # Start streaming if not already
     if CONNECTED and display_name not in STREAMING_ASSETS:
-        log(f"⏳ Starting streaming for {display_name} (requested as '{pair}')", level=1)
+        log(f"⏳ Starting streaming for {display_name}", level=1)
         asyncio.run_coroutine_threadsafe(start_streaming(display_name), ASYNC_LOOP)
 
-    # ----- GET CANDLES -----
+    # Get candles
     candles = []
     if display_name in CANDLES and timeframe in CANDLES[display_name]:
         candles = CANDLES[display_name][timeframe]
-    # If not yet available, return empty; streaming is in background.
     candles = candles[-count:] if candles else []
 
-    # ----- FORMAT RESPONSE -----
+    # Format response
     api_tf = TIMEFRAME_API_MAP.get(timeframe, timeframe.upper())
     market_name = ASSET_DISPLAY_MAP.get(internal_name, display_name)
     data = []
@@ -402,15 +448,21 @@ def startup_background():
     if not email or not password:
         log("❌ QUOTEX_EMAIL and QUOTEX_PASSWORD must be set as environment variables", level=0)
         return
-    future = asyncio.run_coroutine_threadsafe(connect_to_quotex(email, password), ASYNC_LOOP)
-    try:
-        success, msg = future.result(timeout=30)
-        if success:
-            log("✅ Quotex connected. Ready to stream on demand.", level=1)
-        else:
-            log(f"❌ Connection failed: {msg}", level=0)
-    except Exception as e:
-        log(f"❌ Startup error: {e}", level=0)
+    # Retry connection up to 3 times
+    for attempt in range(3):
+        future = asyncio.run_coroutine_threadsafe(connect_to_quotex(email, password), ASYNC_LOOP)
+        try:
+            success, msg = future.result(timeout=30)
+            if success:
+                log("✅ Quotex connected. Ready to stream on demand.", level=1)
+                return
+            else:
+                log(f"❌ Connection attempt {attempt+1} failed: {msg}", level=0)
+        except Exception as e:
+            log(f"❌ Startup error attempt {attempt+1}: {e}", level=0)
+        if attempt < 2:
+            time.sleep(5)  # wait before retry
+    log("❌ All connection attempts failed. Try setting QUOTEX_PROXY manually.", level=0)
 
 threading.Thread(target=startup_background, daemon=True, name="Startup").start()
 
