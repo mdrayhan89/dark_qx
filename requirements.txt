@@ -1,0 +1,4 @@
+Flask==2.3.3
+gunicorn==21.2.0
+certifi==2024.2.2
+git+https://github.com/cleitonleonel/pyquotex.git@master
